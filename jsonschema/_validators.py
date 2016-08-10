@@ -5,9 +5,6 @@ from jsonschema.exceptions import FormatError, ValidationError
 from jsonschema.compat import iteritems
 
 
-FLOAT_TOLERANCE = 10 ** -15
-
-
 def patternProperties(validator, patternProperties, instance, schema):
     if not validator.is_type(instance, "object"):
         return
@@ -16,7 +13,7 @@ def patternProperties(validator, patternProperties, instance, schema):
         for k, v in iteritems(instance):
             if re.search(pattern, k):
                 for error in validator.descend(
-                        v, subschema, path=k, schema_path=pattern
+                    v, subschema, path=k, schema_path=pattern,
                 ):
                     yield error
 
@@ -47,7 +44,7 @@ def items(validator, items, instance, schema):
     else:
         for (index, item), subschema in zip(enumerate(instance), items):
             for error in validator.descend(
-                    item, subschema, path=index, schema_path=index
+                item, subschema, path=index, schema_path=index,
             ):
                 yield error
 
@@ -76,7 +73,6 @@ def minimum(validator, minimum, instance, schema):
     if not validator.is_type(instance, "number"):
         return
 
-    instance = float(instance)
     if schema.get("exclusiveMinimum", False):
         failed = instance <= minimum
         cmp = "less than or equal to"
@@ -94,7 +90,6 @@ def maximum(validator, maximum, instance, schema):
     if not validator.is_type(instance, "number"):
         return
 
-    instance = float(instance)
     if schema.get("exclusiveMaximum", False):
         failed = instance >= maximum
         cmp = "greater than or equal to"
@@ -113,8 +108,8 @@ def multipleOf(validator, dB, instance, schema):
         return
 
     if isinstance(dB, float):
-        mod = instance % dB
-        failed = (mod > FLOAT_TOLERANCE) and (dB - mod) > FLOAT_TOLERANCE
+        quotient = instance / dB
+        failed = int(quotient) != quotient
     else:
         failed = instance % dB
 
@@ -177,7 +172,7 @@ def dependencies(validator, dependencies, instance, schema):
 
         if validator.is_type(dependency, "object"):
             for error in validator.descend(
-                    instance, dependency, schema_path=property
+                instance, dependency, schema_path=property,
             ):
                 yield error
         else:
@@ -195,9 +190,20 @@ def enum(validator, enums, instance, schema):
 
 
 def ref(validator, ref, instance, schema):
-    with validator.resolver.resolving(ref) as resolved:
-        for error in validator.descend(instance, resolved):
-            yield error
+    resolve = getattr(validator.resolver, "resolve", None)
+    if resolve is None:
+        with validator.resolver.resolving(ref) as resolved:
+            for error in validator.descend(instance, resolved):
+                yield error
+    else:
+        scope, resolved = validator.resolver.resolve(ref)
+        validator.resolver.push_scope(scope)
+
+        try:
+            for error in validator.descend(instance, resolved):
+                yield error
+        finally:
+            validator.resolver.pop_scope()
 
 
 def type_draft3(validator, types, instance, schema):

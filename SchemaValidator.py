@@ -8,6 +8,15 @@ import re
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 import jsonschema
 
+
+class OnSaveHandler(sublime_plugin.EventListener):
+
+    def on_post_save(self, view):
+        # Only run on json files
+        if "JSON" in view.settings().get('syntax'):
+            view.run_command('validate_schema')
+
+
 class Loading():
     def __init__(self, view, status_message, display_message, callback):
         self.view = view
@@ -31,44 +40,77 @@ class Loading():
         self.view.erase_status(self.status_message)
         pass
 
-class ValidateSchemaCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        self.thread = ValidateSchema(self.window.active_view())
+class ValidateSchemaCommand(sublime_plugin.TextCommand):
+    def run(self, edit, immediate=True):
+        self.view.erase_status('schema_validator_status')
+        self.thread = ValidateSchema(self.view)
         self.thread.start()
-        self.loading = Loading(self.window.active_view(), "match_schema", "Matching File to schema", self.handle_thread)
+        self.loading = Loading(self.view, "match_schema", "Matching File to schema", self.handle_thread)
         self.handle_thread()
+
     def handle_thread(self):
         if self.thread.is_alive():
             self.loading.increment()
             return
         self.loading.clear()
-        if self.thread.result == False:
-            sublime.status_message(self.thread.message)
-        elif self.thread.result == True:
-            sublime.status_message(self.thread.message)
+        if len(self.thread.errors) > 0:
+            display_errors = [[e[0], "Line: {}".format(e[1]['row'])] for e in self.thread.errors]
+            self.view.window().show_quick_panel(
+                display_errors, self._jump, 0, 0, self._jump)
         else:
-            sublime.status_message("Something went wrong. Please try again")
+            self.view.set_status('schema_validator_status', self.thread.message)
         return
+
+    def _jump(self, item):
+        """
+        Jump to a line in the view buffer
+        """
+
+        if item == -1:
+            return
+
+        error, position = self.thread.errors[item]
+
+        col = position.get('col', 1) - 1
+        self.view.sel().clear()
+
+        if type(position['row']) in (list, tuple):
+            lineno = position['row'][0] - 1
+            endlineno = position['row'][1]
+            pt = self.view.text_point(lineno, 0)
+            endpt = self.view.text_point(endlineno, 0)
+            self.view.sel().add(sublime.Region(pt, endpt))
+        else:
+            lineno = position['row'] - 1
+
+            pt = self.view.text_point(lineno, col)
+            self.view.sel().add(sublime.Region(pt))
+
+        self.view.show(pt)
 
 class ValidateSchema(threading.Thread):
     def __init__(self,view):
-        self.result = None
         self.message = None
+        self.errors = []
         self.view = view
         threading.Thread.__init__(self)
+
     def run(self):
+
+        self.errors = []
+        self.raw_data = self.view.substr(sublime.Region(0, self.view.size()))
+
         # Check for valid JSON
         try:
-            json_data = json.loads(self.view.substr(sublime.Region(0, self.view.size())))
+            json_data = json.loads(self.raw_data)
         except ValueError as e:
-            self.message = "Not valid JSON file"
-            self.result = False
+            self.errors.append(("Not valid JSON file", {'row': 0}))
             return
         # Check for schema in document
         try:
             schema_url = json_data['$schema']
             self.message = schema_url
-            self.result = True
+
         # If no schema attribute was found, let's try a file match
         except (KeyError, TypeError) as e:
             try:
@@ -78,19 +120,18 @@ class ValidateSchema(threading.Thread):
                 try:
                     catalog = json.loads(http_response)["schemas"]
                 except ValueError as e:
-                    self.message = "Retrieved schema is not a valid JSON file"
-                    self.result = False
+                    self.errors.append(("Retrieved schema is not a valid JSON file", {'row': 0}))
+
                     return
                 except LookupError as e:
-                    self.message = "Catalog.json contains no schemas"
-                    self.result = False
+                    self.errors.append(("Catalog.json contains no schemas", {'row': 0}))
+
             except (urllib.request.HTTPError) as e:
-                self.message = "%s: HTTP error %s contacting API" % (__name__, str(e.code))
-                self.result = False
+                self.errors.append(("%s: HTTP error %s contacting API" % (__name__, str(e.code)), {'row': 0}))
+
                 return
             except (urllib.request.URLError) as e:
-                self.message = "%s: URL error %s contacting API" % (__name__, str(e.reason))
-                self.result = False
+                self.errors.append(("%s: URL error %s contacting API" % (__name__, str(e.reason)), {'row': 0}))
                 return
             try:
                 file_name = self.view.file_name()[self.view.window().folders()[0].__len__()+1:]
@@ -111,38 +152,45 @@ class ValidateSchema(threading.Thread):
                 except LookupError as e:
                     pass
             if schema_matched == False:
-                self.message = "No schema could be matched based on the file name. Try adding a $schema attribute to your file"
-                self.result = False
+                self.errors.append(("No schema could be matched. Try adding a $schema attribute", {'row': 0}))
+
                 return
         # Use schema_url to retrieve schema
         try:
             request = urllib.request.Request(schema_url, headers={"User-Agent": "Sublime"})
             http_file = urllib.request.urlopen(request, timeout=5)
-            http_response = http_file.read().decode('utf-8') 
+            http_response = http_file.read().decode('utf-8')
             try:
                 schema = json.loads(http_response)
             except ValueError as e:
-                self.message = "Retrieved schema is not a valid JSON file"
-                self.result = False
+                self.errors.append(("Retrieved schema is not a valid JSON file", {'row': 0}))
+
                 return
         except (urllib.request.HTTPError) as e:
-            self.message = "%s: HTTP error %s contacting API" % (__name__, str(e.code))
-            self.result = False
+            self.errors.append(("%s: HTTP error %s contacting API" % (__name__, str(e.code)), {'row': 0}))
             return
         except (urllib.request.URLError) as e:
-            self.message = "%s: URL error %s contacting API" % (__name__, str(e.reason))
+            self.errors.append(("%s: URL error %s contacting API" % (__name__, str(e.reason)), {'row': 0}))
             return
-            self.result = False
         try:
             jsonschema.validate(json_data, schema)
         except jsonschema.exceptions.ValidationError as e:
-            self.message = "JSON schema validation failed | %s" % e.message
-            self.result = False
+            error_line = self._get_line(e.path)
+            self.errors.append((e.message, {'row': error_line}))
             return
         except jsonschema.exceptions.SchemaError as e:
-            self.message = "JSON schema validation failed | %s" % e.message
-            self.result = False
+            error_line = self._get_line(e.path)
+            self.errors.append((e.message, {'row': error_line}))
             return
         self.message = "JSON Schema successfully validated against %s" % schema_url
-        self.result = True
         return
+
+    def _get_line(self, path):
+        """
+        Attempts to get the line of the property
+        :param path: list or deque
+        :return: int
+        """
+
+        match = re.search("^.*?{}".format(".*?".join(path)), self.raw_data, re.S | re.M)
+        return match.group().count("\n")
